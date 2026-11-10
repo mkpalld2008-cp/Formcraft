@@ -119,6 +119,7 @@ function renderQuestions() {
     </div>
     ${["choice", "checkboxes", "dropdown"].includes(question.type) ? `<div class="options-area"><label class="field-label" for="q-options-${index}">Answer options <span class="optional">One per line · at least 2</span></label>
       <textarea id="q-options-${index}" class="text-input question-options" rows="3" placeholder="Option one\nOption two">${esc((question.options || ["Option 1", "Option 2"]).join("\n"))}</textarea></div>` : ""}
+    ${question.type === "file" ? `<p class="upload-hint">Respondents can attach up to 5 files (10 MB each). Allowed: PDF, common images, and Word, Excel, or PowerPoint files.</p>` : ""}
   </article>`).join("");
 }
 

@@ -1,6 +1,7 @@
 import { collection, doc, getDocs, orderBy, query, getDoc } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
-import { auth, db, configured, showConfigError } from "./firebase.js";
+import { getDownloadURL, ref } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js";
+import { auth, db, storage, configured, showConfigError } from "./firebase.js";
 import { esc, formatDate, queryId, surveyUrl } from "./shared.js";
 
 const root = document.querySelector("#results-state");
@@ -24,7 +25,22 @@ async function loadResults(user) {
   if (!snapshot.exists() || snapshot.data().status === "removed") throw new Error("Survey not found or no longer available.");
   const survey = snapshot.data();
   const responseSnapshot = await getDocs(query(collection(db, "users", user.uid, "surveys", surveyId, "responses"), orderBy("submittedAt", "asc")));
-  const responses = responseSnapshot.docs.map(item => item.data());
+  const responses = await Promise.all(responseSnapshot.docs.map(async item => {
+    const response = item.data();
+    for (const [index, question] of survey.questions.entries()) {
+      if (question.type !== "file") continue;
+      const answer = response.answers?.[question.id || String(index)];
+      if (!Array.isArray(answer?.value)) continue;
+      const allowedPrefix = `survey-responses/${user.uid}/${surveyId}/${item.id}/`;
+      answer.value = await Promise.all(answer.value.map(async file => ({
+        ...file,
+        url: typeof file.path === "string" && file.path.startsWith(allowedPrefix)
+          ? await getDownloadURL(ref(storage, file.path)).catch(() => "")
+          : ""
+      })));
+    }
+    return response;
+  }));
 
   root.innerHTML = `<section class="results-heading"><div><p class="eyebrow">SURVEY RESULTS</p><h1>${esc(survey.title)}</h1><p class="muted">${esc(survey.description || "Response overview and question insights.")}</p></div>
     <div class="results-actions"><a class="button button-secondary" href="${esc(surveyUrl(surveyId, user.uid))}">Open survey ↗</a><button id="export-csv" class="button button-primary" type="button">↓ Export CSV</button></div></section>
@@ -53,7 +69,8 @@ function showMessage(title, body) {
 }
 
 function renderQuestion(question, index, responses) {
-  const answers = responses.map(response => response.answers?.[question.id || String(index)]?.value).filter(value => value !== undefined && value !== "");
+  const answers = responses.map(response => response.answers?.[question.id || String(index)]?.value)
+    .filter(value => value !== undefined && value !== "" && !(question.type === "file" && Array.isArray(value) && !value.length));
   const heading = `<div class="result-card-heading"><div><span class="question-number">QUESTION ${String(index + 1).padStart(2, "0")}</span><h3>${esc(question.title)}</h3></div><span class="answer-count">${answers.length} answers</span></div>`;
   if (["choice", "checkboxes", "dropdown"].includes(question.type)) return `<article class="result-card">${heading}<div class="chart-wrap"><canvas id="chart-${index}" aria-label="Bar chart for ${esc(question.title)}" role="img"></canvas></div></article>`;
   if (question.type === "rating") {
@@ -61,13 +78,18 @@ function renderQuestion(question, index, responses) {
     const average = ratings.length ? (ratings.reduce((total, value) => total + value, 0) / ratings.length).toFixed(1) : "—";
     return `<article class="result-card">${heading}<div class="rating-summary"><strong>${average}</strong><span class="rating-stars">★★★★★</span><span class="muted small">Average rating out of 5</span></div></article>`;
   }
+  if (question.type === "file") return `<article class="result-card">${heading}${answers.length ? `<ul class="text-answer-list">${answers.slice(-40).reverse().flatMap(value => (Array.isArray(value) ? value : []).map(file => `<li>${file.url ? `<a class="file-answer-link" href="${esc(file.url)}" target="_blank" rel="noopener noreferrer">↗ ${esc(file.name)}</a>` : esc(file.name)}<span class="file-answer-size">${formatFileSize(file.size)}</span></li>`)).join("")}</ul>` : `<p class="muted small">No files attached.</p>`}</article>`;
   return `<article class="result-card">${heading}${answers.length ? `<ul class="text-answer-list">${answers.slice(-40).reverse().map(value => `<li>${esc(Array.isArray(value) ? value.join(", ") : value)}</li>`).join("")}</ul>` : `<p class="muted small">No answers yet.</p>`}</article>`;
+}
+
+function formatFileSize(bytes = 0) {
+  return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function exportCsv(survey, responses) {
   const rows = [["Submitted at", ...survey.questions.map(question => question.title)], ...responses.map(response => [response.submittedAt?.toDate?.().toISOString() || "", ...survey.questions.map((question, index) => {
     const value = response.answers?.[question.id || String(index)]?.value;
-    return Array.isArray(value) ? value.join("; ") : value ?? "";
+    return Array.isArray(value) ? value.map(item => typeof item === "object" ? item.name : item).join("; ") : value ?? "";
   })])];
   const csv = rows.map(row => row.map(value => `"${String(value).replace(/"/g, '""')}"`).join(",")).join("\r\n");
   const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });

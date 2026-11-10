@@ -1,6 +1,6 @@
 export const TYPES = [
   ["short", "Short text"], ["paragraph", "Paragraph"], ["choice", "Multiple choice"],
-  ["checkboxes", "Checkboxes"], ["dropdown", "Dropdown"], ["rating", "Rating (1–5)"]
+  ["checkboxes", "Checkboxes"], ["dropdown", "Dropdown"], ["rating", "Rating (1–5)"], ["file", "File upload"]
 ];
 export const esc = (value = "") => String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 export const surveyUrl = (id, ownerId) => new URL(`survey.html?id=${encodeURIComponent(id)}&owner=${encodeURIComponent(ownerId)}`, location.href).href;

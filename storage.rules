@@ -1,0 +1,17 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Survey links are public, so respondents may upload attachments without signing in.
+    // Limit uploads to supported document/image formats and 10 MB per file.
+    match /survey-responses/{ownerId}/{surveyId}/{responseId}/{fileName} {
+      // Only the survey owner can download files from the results dashboard.
+      allow get: if request.auth != null && request.auth.uid == ownerId;
+      allow list: if false;
+      allow create: if request.resource.size <= 10 * 1024 * 1024
+        && request.resource.contentType.matches(
+          'application/pdf|image/(jpeg|png|gif|webp)|application/msword|application/vnd\\.openxmlformats-officedocument\\.(wordprocessingml\\.document|spreadsheetml\\.sheet|presentationml\\.presentation)|application/vnd\\.ms-(excel|powerpoint)'
+        );
+      allow update, delete: if false;
+    }
+  }
+}
