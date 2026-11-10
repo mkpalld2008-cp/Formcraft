@@ -1,5 +1,5 @@
 import { collection, doc, getDoc, serverTimestamp, setDoc } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
-import { ref, uploadBytes } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js";
+import { ref, uploadBytesResumable } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js";
 import { db, storage, configured, showConfigError } from "./firebase.js";
 import { esc, queryId, queryOwner } from "./shared.js";
 
@@ -29,6 +29,7 @@ else if (!id || !ownerId) {
             <label class="field-label" for="answer-${index}">${esc(question.title)} ${question.required ? `<span class="required-mark">*</span>` : `<span class="optional">Optional</span>`}</label>
             ${answerControl(question, index)}
           </div>`).join("")}
+          <p id="upload-status" class="upload-status" role="status" aria-live="polite"></p>
           <div id="form-error" class="inline-error" role="alert"></div>
           <button class="button button-primary button-large" type="submit">Submit response <span aria-hidden="true">→</span></button>
         </form>
@@ -44,6 +45,7 @@ async function submitResponse(event, survey, ownerId, surveyId) {
   event.preventDefault();
   const form = event.currentTarget;
   const errorBox = document.querySelector("#form-error");
+  const uploadStatus = document.querySelector("#upload-status");
   const answers = {};
 
   for (const [index, question] of survey.questions.entries()) {
@@ -77,9 +79,15 @@ async function submitResponse(event, survey, ownerId, surveyId) {
 
   const submit = form.querySelector("button[type=submit]");
   submit.disabled = true;
-  submit.textContent = "Submitting…";
+  submit.textContent = "Preparing response…";
+  uploadStatus.textContent = "";
   try {
     const responseRef = doc(collection(db, "users", ownerId, "surveys", surveyId, "responses"));
+    const filesToUpload = survey.questions.reduce((total, question, index) => {
+      return total + (question.type === "file" ? answers[question.id || String(index)].value.length : 0);
+    }, 0);
+    if (filesToUpload) uploadStatus.textContent = "Connecting to file storage…";
+    let completedFiles = 0;
     for (const [index, question] of survey.questions.entries()) {
       if (question.type !== "file") continue;
       const answer = answers[question.id || String(index)];
@@ -88,15 +96,28 @@ async function submitResponse(event, survey, ownerId, surveyId) {
         const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "attachment";
         const fileRef = ref(storage, `survey-responses/${ownerId}/${surveyId}/${responseRef.id}/${index}-${crypto.randomUUID()}-${safeName}`);
         const contentType = ALLOWED_MIME_TYPES.has(file.type) ? file.type : mimeTypeFromName(file.name);
-        await uploadBytes(fileRef, file, { contentType });
+        const fileNumber = completedFiles + 1;
+        await uploadFile(fileRef, file, { contentType }, percent => {
+          uploadStatus.textContent = `Uploading file ${fileNumber} of ${filesToUpload}: ${percent}%`;
+          submit.textContent = `Uploading ${fileNumber}/${filesToUpload} · ${percent}%`;
+        });
         files.push({ name: file.name, path: fileRef.fullPath, size: file.size, type: contentType });
+        completedFiles++;
       }
       answer.value = files;
     }
+    submit.textContent = "Saving response…";
+    uploadStatus.textContent = "Saving your response…";
     await setDoc(responseRef, { answers, submittedAt: serverTimestamp() });
     state.innerHTML = `<div class="thank-you"><div class="success-mark">✓</div><p class="eyebrow">RESPONSE RECEIVED</p><h1>Thank you!</h1><p class="muted">Your response has been submitted successfully.</p></div>`;
   } catch (error) {
-    errorBox.textContent = `Couldn’t submit your response: ${error.message}`;
+    uploadStatus.textContent = "";
+    const detail = error?.code === "storage/unauthorized"
+      ? "Firebase Storage denied the upload. Confirm that the rules in storage.rules are published under Firebase Console → Storage → Rules."
+      : error?.code === "formcraft/upload-timeout"
+        ? "The upload timed out. Check your internet connection and try again."
+        : error?.message || "Please try again.";
+    errorBox.textContent = `Couldn’t submit your response: ${detail}`;
     submit.disabled = false;
     submit.innerHTML = `Submit response <span aria-hidden="true">→</span>`;
   }
@@ -104,6 +125,7 @@ async function submitResponse(event, survey, ownerId, surveyId) {
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_FILES = 5;
+const UPLOAD_TIMEOUT_MS = 120_000;
 const ALLOWED_MIME_TYPES = new Set([
   "application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp",
   "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -118,6 +140,35 @@ const mimeTypeFromName = name => ({
   ppt: "application/vnd.ms-powerpoint", pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 })[name.split(".").pop().toLowerCase()] || "application/octet-stream";
 const isAllowedFile = file => ALLOWED_MIME_TYPES.has(file.type) || (!file.type && ALLOWED_EXTENSIONS.test(file.name));
+
+function uploadFile(fileRef, file, metadata, onProgress) {
+  return new Promise((resolve, reject) => {
+    const task = uploadBytesResumable(fileRef, file, metadata);
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(Object.assign(new Error("Upload timed out after two minutes."), { code: "formcraft/upload-timeout" }));
+      task.cancel();
+    }, UPLOAD_TIMEOUT_MS);
+
+    task.on("state_changed", snapshot => {
+      if (settled) return;
+      const percent = snapshot.totalBytes ? Math.round(snapshot.bytesTransferred / snapshot.totalBytes * 100) : 0;
+      onProgress(percent);
+    }, error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    }, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(task.snapshot);
+    });
+  });
+}
 
 function answerControl(question, index) {
   const id = `answer-${index}`;
