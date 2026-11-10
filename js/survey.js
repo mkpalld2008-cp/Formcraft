@@ -1,6 +1,6 @@
 import { collection, doc, getDoc, serverTimestamp, setDoc } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
-import { ref, uploadBytesResumable } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js";
-import { db, storage, configured, showConfigError } from "./firebase.js";
+import { db, configured, showConfigError } from "./firebase.js";
+import { supabase, supabaseConfigured, FILE_BUCKET } from "./supabase.js";
 import { esc, queryId, queryOwner } from "./shared.js";
 
 const state = document.querySelector("#survey-state");
@@ -21,6 +21,7 @@ else if (!id || !ownerId) {
       state.innerHTML = `<div class="empty-state"><h2>This survey is no longer available</h2><p>The survey host has removed it from their survey list.</p></div>`;
     } else {
       document.title = `${survey.title} · Formcraft`;
+      const includesFileUpload = (survey.questions || []).some(question => question.type === "file");
       state.innerHTML = `<div class="public-kicker"><span class="brand-mark">F</span> FORMCRAFT SURVEY</div>
         <h1>${esc(survey.title)}</h1>${survey.description ? `<p class="public-description">${esc(survey.description)}</p>` : ""}
         <div class="public-divider"></div>
@@ -33,7 +34,7 @@ else if (!id || !ownerId) {
           <div id="form-error" class="inline-error" role="alert"></div>
           <button class="button button-primary button-large" type="submit">Submit response <span aria-hidden="true">→</span></button>
         </form>
-        <p class="privacy-note">Your response is shared with the survey creator.</p>`;
+        <p class="privacy-note">Your response is shared with the survey creator.${includesFileUpload ? " Uploaded files use shareable links; anyone with a direct file link can access that file." : ""}</p>`;
       document.querySelector("#response-form").addEventListener("submit", event => submitResponse(event, survey, ownerId, id));
     }
   }
@@ -94,14 +95,14 @@ async function submitResponse(event, survey, ownerId, surveyId) {
       const files = [];
       for (const file of answer.value) {
         const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "attachment";
-        const fileRef = ref(storage, `survey-responses/${ownerId}/${surveyId}/${responseRef.id}/${index}-${crypto.randomUUID()}-${safeName}`);
+        const filePath = `${ownerId}/${surveyId}/${responseRef.id}/${index}-${crypto.randomUUID()}-${safeName}`;
         const contentType = ALLOWED_MIME_TYPES.has(file.type) ? file.type : mimeTypeFromName(file.name);
         const fileNumber = completedFiles + 1;
-        await uploadFile(fileRef, file, { contentType }, percent => {
-          uploadStatus.textContent = `Uploading file ${fileNumber} of ${filesToUpload}: ${percent}%`;
-          submit.textContent = `Uploading ${fileNumber}/${filesToUpload} · ${percent}%`;
-        });
-        files.push({ name: file.name, path: fileRef.fullPath, size: file.size, type: contentType });
+        if (!supabaseConfigured || !supabase) throw new Error("File storage is not configured yet. Add the Supabase project URL and publishable key in js/supabase-config.js.");
+        uploadStatus.textContent = `Uploading file ${fileNumber} of ${filesToUpload}: ${file.name}`;
+        submit.textContent = `Uploading ${fileNumber}/${filesToUpload}…`;
+        await uploadFile(file, filePath, contentType);
+        files.push({ name: file.name, path: filePath, size: file.size, type: contentType });
         completedFiles++;
       }
       answer.value = files;
@@ -112,9 +113,7 @@ async function submitResponse(event, survey, ownerId, surveyId) {
     state.innerHTML = `<div class="thank-you"><div class="success-mark">✓</div><p class="eyebrow">RESPONSE RECEIVED</p><h1>Thank you!</h1><p class="muted">Your response has been submitted successfully.</p></div>`;
   } catch (error) {
     uploadStatus.textContent = "";
-    const detail = error?.code === "storage/unauthorized"
-      ? "Firebase Storage denied the upload. Confirm that the rules in storage.rules are published under Firebase Console → Storage → Rules."
-      : error?.code === "formcraft/upload-timeout"
+    const detail = error?.code === "formcraft/upload-timeout"
         ? "The upload timed out. Check your internet connection and try again."
         : error?.message || "Please try again.";
     errorBox.textContent = `Couldn’t submit your response: ${detail}`;
@@ -141,33 +140,25 @@ const mimeTypeFromName = name => ({
 })[name.split(".").pop().toLowerCase()] || "application/octet-stream";
 const isAllowedFile = file => ALLOWED_MIME_TYPES.has(file.type) || (!file.type && ALLOWED_EXTENSIONS.test(file.name));
 
-function uploadFile(fileRef, file, metadata, onProgress) {
-  return new Promise((resolve, reject) => {
-    const task = uploadBytesResumable(fileRef, file, metadata);
-    let settled = false;
-    const timeout = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      reject(Object.assign(new Error("Upload timed out after two minutes."), { code: "formcraft/upload-timeout" }));
-      task.cancel();
-    }, UPLOAD_TIMEOUT_MS);
-
-    task.on("state_changed", snapshot => {
-      if (settled) return;
-      const percent = snapshot.totalBytes ? Math.round(snapshot.bytesTransferred / snapshot.totalBytes * 100) : 0;
-      onProgress(percent);
-    }, error => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      reject(error);
-    }, () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve(task.snapshot);
+async function uploadFile(file, path, contentType) {
+  let timeout;
+  try {
+    const upload = supabase.storage.from(FILE_BUCKET).upload(path, file, {
+      cacheControl: "3600", contentType, upsert: false
     });
-  });
+    const result = await Promise.race([
+      upload,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(Object.assign(
+          new Error("Upload timed out after two minutes."), { code: "formcraft/upload-timeout" }
+        )), UPLOAD_TIMEOUT_MS);
+      })
+    ]);
+    if (result.error) throw new Error(`Supabase Storage upload failed: ${result.error.message}`);
+    return result.data;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function answerControl(question, index) {

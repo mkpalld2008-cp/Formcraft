@@ -1,7 +1,7 @@
 import { collection, doc, getDocs, orderBy, query, getDoc } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
-import { getDownloadURL, ref } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js";
-import { auth, db, storage, configured, showConfigError } from "./firebase.js";
+import { auth, db, configured, showConfigError } from "./firebase.js";
+import { supabase, FILE_BUCKET } from "./supabase.js";
 import { esc, formatDate, queryId, surveyUrl } from "./shared.js";
 
 const root = document.querySelector("#results-state");
@@ -31,11 +31,11 @@ async function loadResults(user) {
       if (question.type !== "file") continue;
       const answer = response.answers?.[question.id || String(index)];
       if (!Array.isArray(answer?.value)) continue;
-      const allowedPrefix = `survey-responses/${user.uid}/${surveyId}/${item.id}/`;
+      const allowedPrefix = `${user.uid}/${surveyId}/${item.id}/`;
       answer.value = await Promise.all(answer.value.map(async file => ({
         ...file,
-        url: typeof file.path === "string" && file.path.startsWith(allowedPrefix)
-          ? await getDownloadURL(ref(storage, file.path)).catch(() => "")
+        url: supabase && typeof file.path === "string" && file.path.startsWith(allowedPrefix)
+          ? supabase.storage.from(FILE_BUCKET).getPublicUrl(file.path).data.publicUrl
           : ""
       })));
     }
@@ -87,10 +87,26 @@ function formatFileSize(bytes = 0) {
 }
 
 function exportCsv(survey, responses) {
-  const rows = [["Submitted at", ...survey.questions.map(question => question.title)], ...responses.map(response => [response.submittedAt?.toDate?.().toISOString() || "", ...survey.questions.map((question, index) => {
-    const value = response.answers?.[question.id || String(index)]?.value;
-    return Array.isArray(value) ? value.map(item => typeof item === "object" ? item.name : item).join("; ") : value ?? "";
-  })])];
+  const columns = survey.questions.flatMap((question, index) => {
+    if (question.type === "file") return Array.from({ length: 5 }, (_, fileIndex) => {
+      const fileFor = response => response.answers?.[question.id || String(index)]?.value?.[fileIndex];
+      return [
+        { title: `${question.title} (file ${fileIndex + 1} name)`, value: response => fileFor(response)?.name || "" },
+        { title: `${question.title} (file ${fileIndex + 1} URL)`, value: response => fileFor(response)?.url || "" }
+      ];
+    }).flat();
+    return [{
+      title: question.title,
+      value: response => {
+        const answer = response.answers?.[question.id || String(index)]?.value;
+        return Array.isArray(answer) ? answer.join("; ") : answer ?? "";
+      }
+    }];
+  });
+  const rows = [
+    ["Submitted at", ...columns.map(column => column.title)],
+    ...responses.map(response => [response.submittedAt?.toDate?.().toISOString() || "", ...columns.map(column => column.value(response))])
+  ];
   const csv = rows.map(row => row.map(value => `"${String(value).replace(/"/g, '""')}"`).join(",")).join("\r\n");
   const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
   const link = document.createElement("a");
